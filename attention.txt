@@ -1,0 +1,149 @@
+# aggregate (TOP-K strategy)
+    probs_sorted = sorted(probs, reverse=True)
+    #top_k = probs_sorted[:max(1, len(probs)//3)]
+
+    '''k = max(1, int(len(probs) * 0.3))
+    top_k = probs_sorted[:k]
+    score = sum(top_k) / len(top_k)'''
+
+    '''k = int(len(probs) * 0.2)  # remove extremes
+
+    if len(probs) > 2*k:
+        trimmed = probs_sorted[k:len(probs)-k]
+    else:
+        trimmed = probs_sorted  # not enough chunks to trim, use all
+
+    if probs_sorted != trimmed:
+        print("trimmed probabilities:", trimmed, flush=True)
+    else:        
+        print("No trimming applied, using all probabilities.", flush=True)
+    score = sum(trimmed) / len(trimmed)
+
+    pred = "FAKE" if score >= 0.5 else "REAL"'''
+
+
+Train.py
+    seed_everything(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
+
+    train_cfg = TrainConfig(
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        lr=args.lr,
+        hidden_size=args.hidden_size,
+        dropout=args.dropout,
+        seed=args.seed,
+        num_workers=args.num_workers,
+    )
+
+    train_df = pd.read_csv(SPLITS_DIR / "train.csv")
+    val_df = pd.read_csv(SPLITS_DIR / "val.csv")
+    test_df = pd.read_csv(SPLITS_DIR / "test.csv")
+
+    # ---------- APPLY SAMPLING ----------
+    '''print("sampling to balance classes and reduce size for faster training...")
+    train_df = stratified_sample(train_df, 200000)   # 100k real + 100k fake
+    val_df = stratified_sample(val_df, 50000)        # 25k + 25k
+    test_df = stratified_sample(test_df, 50000)      # 25k + 25k'''
+
+    print(f"Train: {len(train_df)} | Val: {len(val_df)} | Test: {len(test_df)}")
+
+    workers = train_cfg.num_workers
+    pin_mem = device.type == "cuda"
+    #persistent = workers > 0 and device.type == "cuda"
+
+    loader_kwargs = {
+        "num_workers": workers,
+        "pin_memory": pin_mem,
+        #"persistent_workers": True,
+        #"prefetch_factor": 4,   # 🔥 increase prefetch
+    }
+
+    train_loader = DataLoader(
+        MelDataset(train_df, augment=True),
+        batch_size=train_cfg.batch_size,
+        #sampler=_make_balanced_sampler(train_df),
+        shuffle=True,
+        **loader_kwargs,
+    )
+
+    val_loader = DataLoader(
+        MelDataset(val_df),
+        batch_size=train_cfg.batch_size,
+        shuffle=False,
+        **loader_kwargs,
+    )
+
+    test_loader = DataLoader(
+        MelDataset(test_df),
+        batch_size=train_cfg.batch_size,
+        shuffle=False,
+        **loader_kwargs,
+    )
+
+    model = CnnBiLstmDetector(hidden_size=train_cfg.hidden_size, dropout=train_cfg.dropout).to(device)
+
+    fake_count = int((train_df["label"] == 1).sum())
+    real_count = int((train_df["label"] == 0).sum())
+    # alpha controls weight for positive class in focal loss.
+    # If fake is rare, alpha should increase.
+    alpha = min(0.95, max(0.25, real_count / max(1, (fake_count + real_count))))
+    pos_weight = torch.tensor([real_count / max(1, fake_count)], device=device, dtype=torch.float32)
+    criterion = HybridLoss(pos_weight=pos_weight, focal_alpha=alpha, gamma=2.0, focal_ratio=0.35)
+
+    optimizer = AdamW(model.parameters(), lr=train_cfg.lr, weight_decay=train_cfg.weight_decay)
+    scheduler = ReduceLROnPlateau(optimizer, mode="min", patience=2, factor=0.3)
+    scaler = amp.GradScaler("cuda") if device.type == "cuda" else None
+
+    best_f1 = -1.0
+    patience, patience_counter = 7, 0
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    best_path = MODELS_DIR / "best_cnn_bilstm.pt"
+    history = []
+
+    for epoch in range(1, train_cfg.epochs + 1):
+        clean_memory()
+        train_loss = run_epoch(model, train_loader, criterion, optimizer, device, scaler)
+        clean_memory()
+        val_metrics = evaluate(model, val_loader, criterion, device)
+        clean_memory()
+        if not val_metrics:
+            raise RuntimeError("Validation returned empty metrics.")
+
+        scheduler.step(val_metrics["loss"])
+        val_metrics["train_loss"] = train_loss
+        val_metrics["epoch"] = epoch
+        history.append(val_metrics)
+
+        print(
+            f"Epoch {epoch} | train_loss={train_loss:.4f} | "
+            f"val_f1={val_metrics['f1']:.4f} | val_auc={val_metrics['roc_auc']:.4f}"
+        )
+
+        if val_metrics["f1"] > best_f1:
+            best_f1 = val_metrics["f1"]
+            patience_counter = 0
+            torch.save({"model": model.state_dict(), "config": train_cfg.__dict__}, best_path)
+        else:
+            patience_counter += 1
+
+        if patience_counter >= patience:
+            print("Early stopping triggered")
+            break
+
+    checkpoint = torch.load(best_path, map_location=device, weights_only=True)
+    model.load_state_dict(checkpoint["model"])
+    
+    clean_memory() 
+    print("Testing is in process.Data fetch from test.csv...")
+    test_metrics = evaluate(model, test_loader, criterion, device, threshold=0.6)
+    clean_memory() 
+
+    print("\n===== TEST RESULTS =====")
+    for k, v in test_metrics.items():
+        print(f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}"
+    pd.DataFrame(history).to_csv(MODELS_DIR / "history.csv", index=False)
+
+
+     ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["Real", "Fake"]).plot(cmap="Blues")

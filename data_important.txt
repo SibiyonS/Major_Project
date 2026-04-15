@@ -1,0 +1,231 @@
+from pathlib import Path
+from typing import List, Tuple
+
+import librosa
+import numpy as np
+import pandas as pd
+import torch
+from sklearn.model_selection import train_test_split
+from torch.utils.data import Dataset
+from tqdm import tqdm
+
+from src.config import AudioConfig
+
+AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".m4a", ".ogg"}
+
+
+# =========================
+# LABEL INFERENCE
+# =========================
+def _infer_label_and_source(path: Path, folder_label_map: dict[str, int] | None = None) -> tuple[int | None, str]:
+    folder_label_map = folder_label_map or {}
+    map_lower = {k.lower(): v for k, v in folder_label_map.items()}
+
+    parts_lower = [part.lower() for part in path.parts]
+    source = path.parent.name
+
+    # explicit mapping
+    for part in reversed(parts_lower):
+        if part in map_lower:
+            return map_lower[part], part
+
+    # keyword fallback
+    for part in reversed(parts_lower):
+        if "real" in part:
+            return 0, part
+        if "fake" in part:
+            return 1, part
+
+    return None, source
+
+
+# =========================
+# COLLECT FILES
+# =========================
+def collect_audio_files(dataset_root: Path, folder_label_map: dict[str, int] | None = None) -> pd.DataFrame:
+    rows = []
+
+    for path in dataset_root.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in AUDIO_EXTENSIONS:
+            continue
+
+        label, source = _infer_label_and_source(path, folder_label_map)
+        if label is None:
+            continue
+
+        rows.append({
+            "audio_path": str(path),
+            "label": int(label),
+            "source": source
+        })
+
+    if not rows:
+        raise ValueError(f"No labeled audio files found under {dataset_root}")
+
+    return pd.DataFrame(rows).sample(frac=1.0, random_state=42).reset_index(drop=True)
+
+
+# =========================
+# AUDIO PROCESSING (FIXED)
+# =========================
+def load_and_preprocess_audio(audio_path: str, cfg: AudioConfig) -> List[np.ndarray]:
+    waveform, _ = librosa.load(audio_path, sr=cfg.sample_rate, mono=True)
+    waveform, _ = librosa.effects.trim(waveform, top_db=30)
+
+    # normalize safely
+    waveform = waveform / (np.max(np.abs(waveform)) + 1e-8)
+
+    window_size = cfg.max_samples
+    hop_size = window_size // 2
+
+    # ✅ FIX: ensure at least window-size padding for short audio
+    if len(waveform) < window_size:
+        waveform = np.pad(waveform, (0, window_size - len(waveform)))
+
+    features = []
+
+    for start in range(0, len(waveform), hop_size):
+        chunk = waveform[start:start + window_size]
+
+        # ensure fixed size
+        if len(chunk) < window_size:
+            chunk = np.pad(chunk, (0, window_size - len(chunk)))
+
+        mel = librosa.feature.melspectrogram(
+            y=chunk,
+            sr=cfg.sample_rate,
+            n_fft=cfg.n_fft,
+            hop_length=cfg.hop_length,
+            n_mels=cfg.n_mels,
+            fmin=cfg.fmin,
+            fmax=cfg.fmax,
+            power=2.0,
+        )
+
+        log_mel = librosa.power_to_db(mel, ref=np.max)
+        log_mel = (log_mel - np.mean(log_mel)) / (np.std(log_mel) + 1e-8)
+
+        features.append(log_mel.astype(np.float32))
+
+    # safety fallback (should rarely trigger now)
+    if len(features) == 0:
+        chunk = np.pad(waveform[:window_size], (0, max(0, window_size - len(waveform))))
+
+        mel = librosa.feature.melspectrogram(
+            y=chunk,
+            sr=cfg.sample_rate,
+            n_fft=cfg.n_fft,
+            hop_length=cfg.hop_length,
+            n_mels=cfg.n_mels,
+            fmin=cfg.fmin,
+            fmax=cfg.fmax,
+            power=2.0,
+        )
+
+        log_mel = librosa.power_to_db(mel, ref=np.max)
+        log_mel = (log_mel - np.mean(log_mel)) / (np.std(log_mel) + 1e-8)
+
+        features.append(log_mel.astype(np.float32))
+
+    return features
+
+
+# =========================
+# FEATURE CACHE
+# =========================
+def build_feature_cache(df: pd.DataFrame, cache_dir: Path, cfg: AudioConfig) -> pd.DataFrame:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    out_rows = []
+
+    grouped = df.groupby("audio_path")
+
+    for i, (audio_path, group) in enumerate(tqdm(grouped, desc="Preprocessing")):
+
+        features_list = load_and_preprocess_audio(audio_path, cfg)
+
+        # convert list → single array (NUM_CHUNKS, MEL, TIME)
+        features_array = np.stack(features_list, axis=0)
+
+        out_path = cache_dir / f"audio_{i:07d}.npy"
+        np.save(out_path, features_array)
+
+        # store ONE entry per audio (NOT per chunk)
+        out_rows.append({
+            "feature_path": str(out_path),
+            "label": int(group["label"].iloc[0]),
+            "source": group["source"].iloc[0],
+            "audio_path": audio_path,
+            "num_chunks": len(features_list)
+        })
+
+    return pd.DataFrame(out_rows)
+
+# =========================
+# SPLIT (SAFE)
+# =========================
+from sklearn.model_selection import GroupShuffleSplit
+import pandas as pd
+
+
+def make_splits(df: pd.DataFrame, val_size: float = 0.15, test_size: float = 0.15):
+
+    # group = audio file (prevents leakage across chunks)
+    groups = df["audio_path"]
+
+    gss = GroupShuffleSplit(n_splits=1, test_size=(val_size + test_size), random_state=42)
+
+    train_idx, temp_idx = next(gss.split(df, groups=groups))
+    train_df = df.iloc[train_idx].reset_index(drop=True)
+    temp_df = df.iloc[temp_idx].reset_index(drop=True)
+
+    gss2 = GroupShuffleSplit(n_splits=1, test_size=test_size / (val_size + test_size), random_state=42)
+
+    val_idx, test_idx = next(gss2.split(temp_df, groups=temp_df["audio_path"]))
+
+    val_df = temp_df.iloc[val_idx].reset_index(drop=True)
+    test_df = temp_df.iloc[test_idx].reset_index(drop=True)
+
+    return train_df, val_df, test_df
+# =========================
+# DATASET
+# =========================
+class MelDataset(Dataset):
+    def __init__(self, df: pd.DataFrame, augment: bool = False):
+        self.df = df.reset_index(drop=True)
+        self.augment = augment
+
+    def __len__(self) -> int:
+        return len(self.df)
+
+    def _augment(self, x: np.ndarray) -> np.ndarray:
+        # safer masking augmentation
+        if np.random.rand() < 0.5:
+            t = np.random.randint(0, max(1, x.shape[1] // 10))
+            x[:, :t] = 0
+
+        if np.random.rand() < 0.5:
+            f = np.random.randint(0, max(1, x.shape[0] // 10))
+            x[:f, :] = 0
+
+        return x
+
+    def __getitem__(self, idx: int):
+        row = self.df.iloc[idx]
+
+        x = np.load(row["feature_path"]).astype(np.float32)  
+        # shape: (num_chunks, n_mels, time)
+
+        if self.augment:
+            if np.random.rand() < 0.5:
+                t = np.random.randint(0, max(1, x.shape[2] // 10))
+                x[:, :, :t] = 0
+
+            if np.random.rand() < 0.5:
+                f = np.random.randint(0, max(1, x.shape[1] // 10))
+                x[:, :f, :] = 0
+
+        x = torch.tensor(x).unsqueeze(0)  # (1, chunks, mels, time)
+        y = torch.tensor(int(row["label"]), dtype=torch.long)
+
+        return x, y

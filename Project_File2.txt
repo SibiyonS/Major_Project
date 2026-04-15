@@ -1,0 +1,459 @@
+import argparse
+import os
+from pathlib import Path
+from typing import Dict, Tuple
+
+import librosa
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from src.config import AudioConfig, XAI_DIR
+from src.data import load_and_preprocess_audio
+from src.model import CnnBiLstmDetector
+
+
+# ==========================================================
+# Grad-CAM
+# ==========================================================
+def gradcam_for_sample(model: CnnBiLstmDetector, x: torch.Tensor) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Return normalized Grad-CAM heatmap, attention weights, and fake probability."""
+    activations: Dict[str, torch.Tensor] = {}
+    gradients: Dict[str, torch.Tensor] = {}
+
+    def forward_hook(_module, _input, output):
+        activations["value"] = output
+
+    def backward_hook(_module, _grad_input, grad_output):
+        gradients["value"] = grad_output[0]
+
+    target_layer = model.features[-1]
+    h1 = target_layer.register_forward_hook(forward_hook)
+    h2 = target_layer.register_full_backward_hook(backward_hook)
+
+    model.zero_grad(set_to_none=True)
+    logits, attention = model(x, return_attention=True)
+    prob = torch.sigmoid(logits)[0]
+
+    target = logits[0] if prob >= 0.5 else -logits[0]
+    target.backward()
+
+    acts = activations["value"]
+    grads = gradients["value"]
+
+    weights = grads.mean(dim=(2, 3), keepdim=True)
+    cam = (weights * acts).sum(dim=1, keepdim=True)
+    cam = F.relu(cam)
+    cam = F.interpolate(cam, size=x.shape[-2:], mode="bilinear", align_corners=False)
+
+    cam_np = cam.squeeze().detach().cpu().numpy()
+    cam_np = (cam_np - cam_np.min()) / (cam_np.max() - cam_np.min() + 1e-8)
+
+    attn_np = attention.squeeze().detach().cpu().numpy()
+
+    h1.remove()
+    h2.remove()
+
+    return cam_np, attn_np, float(prob.detach().cpu().item())
+
+
+# ==========================================================
+# LLM Explanation (Gemini)
+# ==========================================================
+def generate_reason_with_gemini(
+    pred: str,
+    score: float,
+    cam_path: str,
+    attn_path: str,
+    model_name: str,
+    api_key: str,
+) -> str:
+    """Generate a human-friendly explanation using Gemini with Grad-CAM/attention images."""
+    from google import genai  # type: ignore
+    from PIL import Image
+
+    client = genai.Client(api_key=api_key)
+
+    if score > 0.8:
+        confidence = "High"
+    elif score > 0.6:
+        confidence = "Moderate"
+    else:
+        confidence = "Low"
+
+    try:
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[
+                "You are an expert in deepfake audio detection. Explain results in simple, clear, professional English.",
+                f"""
+Prediction: {pred}
+Fake Probability: {score:.3f}
+Confidence Level: {confidence}
+
+Instructions:
+- Keep explanation SIMPLE and PROFESSIONAL
+- Avoid complex technical jargon
+- Explain like teaching a beginner but not childish
+
+Format:
+1) Final Prediction
+2) Confidence (1 line)
+3) What the model saw in the audio (based on heatmap)
+4) What the model focused on over time (attention)
+5) Final conclusion (1 line)
+""",
+                Image.open(cam_path),
+                Image.open(attn_path),
+            ],
+        )
+
+        text = getattr(response, "text", "")
+        if text:
+            return text.strip()
+        return (
+            f"Prediction: {pred}\n"
+            f"Confidence: {confidence}\n"
+            "Gemini returned an empty explanation; visual evidence files were still generated."
+        )
+    except Exception as e:
+        return (
+            f"Gemini API Error: {e}\n\n"
+            f"Fallback:\nPrediction: {pred}\nConfidence: {confidence}\n\n"
+            "The system detected patterns, but detailed explanation failed."
+        )
+
+
+# ==========================================================
+# Visualization
+# ==========================================================
+def save_gradcam_overlay(
+    mel: np.ndarray,
+    cam: np.ndarray,
+    title: str,
+    cfg: AudioConfig,
+    audio_path: str,
+    output_path: Path,
+) -> Path:
+    audio, sr = librosa.load(audio_path, sr=cfg.sample_rate)
+    duration = len(audio) / sr
+
+    plt.figure(figsize=(10, 4))
+    plt.imshow(mel, aspect="auto", origin="lower", extent=[0, duration, 0, mel.shape[0]])
+    plt.imshow(
+        cam,
+        cmap="jet",
+        alpha=0.35,
+        origin="lower",
+        aspect="auto",
+        extent=[0, duration, 0, mel.shape[0]],
+    )
+    plt.xlabel("Time (seconds)")
+    plt.ylabel("Mel bins")
+    plt.colorbar(label="Grad-CAM intensity")
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.close()
+    return output_path
+
+
+def save_attention_plot(attn: np.ndarray, output_path: Path) -> Path:
+    plt.figure(figsize=(10, 3))
+    plt.plot(attn)
+    plt.title("BiLSTM Attention Over Time Frames")
+    plt.xlabel("Time frame")
+    plt.ylabel("Attention weight")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200)
+    plt.close()
+    return output_path
+
+
+# ==========================================================
+# Inference Pipeline (shared by CLI + UI)
+# ==========================================================
+def load_model(model_path: str, device: str) -> CnnBiLstmDetector:
+    checkpoint = torch.load(model_path, map_location=device)
+    mcfg = checkpoint.get("config", {})
+
+    model = CnnBiLstmDetector(
+        hidden_size=mcfg.get("hidden_size", 128),
+        dropout=mcfg.get("dropout", 0.3),
+    ).to(device)
+    model.load_state_dict(checkpoint["model_state"])
+    model.eval()
+    return model
+
+
+def run_inference_and_explain(
+    audio_path: str,
+    model_path: str,
+    gemini_model: str,
+    gemini_api_key: str,
+) -> Dict[str, str]:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    cfg = AudioConfig()
+    XAI_DIR.mkdir(parents=True, exist_ok=True)
+
+    model = load_model(model_path, device)
+    mel = load_and_preprocess_audio(audio_path, cfg)
+    x = torch.tensor(mel, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
+
+    cam, attn, score = gradcam_for_sample(model, x)
+    pred = "FAKE" if score >= 0.5 else "REAL"
+
+    overlay_path = XAI_DIR / "gradcam_overlay.png"
+    attention_path = XAI_DIR / "attention_weights.png"
+
+    save_gradcam_overlay(
+        mel=mel,
+        cam=cam,
+        title=f"Grad-CAM | Prediction={pred} | fake_prob={score:.3f}",
+        cfg=cfg,
+        audio_path=audio_path,
+        output_path=overlay_path,
+    )
+    save_attention_plot(attn, output_path=attention_path)
+
+    api_key = gemini_api_key or os.getenv("GEMINI_API_KEY", "")
+    if not api_key:
+        explanation = (
+            "Gemini API key missing. Set --gemini_api_key or GEMINI_API_KEY env var.\n"
+            f"Prediction: {pred} (fake_probability={score:.3f}).\n"
+            "Grad-CAM and attention outputs are generated and saved."
+        )
+    else:
+        explanation = generate_reason_with_gemini(
+            pred=pred,
+            score=score,
+            cam_path=str(overlay_path),
+            attn_path=str(attention_path),
+            model_name=gemini_model,
+            api_key=api_key,
+        )
+
+    out_txt = XAI_DIR / "gemini_explanation.txt"
+    out_txt.write_text(explanation, encoding="utf-8")
+
+    return {
+        "prediction": pred,
+        "score": f"{score:.4f}",
+        "overlay_path": str(overlay_path),
+        "attention_path": str(attention_path),
+        "explanation_path": str(out_txt),
+        "explanation": explanation,
+    }
+
+
+def run_single_audio_pipeline(args: argparse.Namespace) -> None:
+    results = run_inference_and_explain(
+        audio_path=args.audio_path,
+        model_path=args.model_path,
+        gemini_model=args.gemini_model,
+        gemini_api_key=args.gemini_api_key,
+    )
+
+    print("=" * 72)
+    print(f"Final Prediction: {results['prediction']}")
+    print(f"Fake Probability: {results['score']}")
+    print("=" * 72)
+    print(results["explanation"])
+    print("=" * 72)
+    print(f"Saved Grad-CAM Overlay : {results['overlay_path']}")
+    print(f"Saved Attention Plot   : {results['attention_path']}")
+    print(f"Saved Text Explanation : {results['explanation_path']}")
+
+
+def launch_ui(args: argparse.Namespace) -> None:
+    import gradio as gr
+
+    def _predict(audio_file: str, api_key: str):
+        if not audio_file:
+            return (
+                "Please upload an audio file.",
+                "",
+                None,
+                None,
+            )
+
+        results = run_inference_and_explain(
+            audio_path=audio_file,
+            model_path=args.model_path,
+            gemini_model=args.gemini_model,
+            gemini_api_key=api_key,
+        )
+
+        header = (
+            f"### Prediction: **{results['prediction']}**\n"
+            f"**Fake Probability:** `{results['score']}`"
+        )
+
+        return header, results["explanation"], results["overlay_path"], results["attention_path"]
+
+    custom_css = """
+    :root {
+      --bg1: #0b1020;
+      --bg2: #111a36;
+      --card: rgba(255,255,255,0.08);
+      --line: rgba(255,255,255,0.16);
+      --text: #e8ecff;
+      --muted: #aab6e6;
+      --accent: #7a8cff;
+      --accent2: #31d0aa;
+    }
+    .gradio-container {
+      max-width: 1200px !important;
+      margin: 0 auto !important;
+      color: var(--text) !important;
+      background: radial-gradient(1200px 600px at 5% -10%, #27356b 0%, transparent 65%),
+                  radial-gradient(900px 500px at 110% 5%, #124d60 0%, transparent 55%),
+                  linear-gradient(160deg, var(--bg1), var(--bg2)) !important;
+      border-radius: 24px;
+      padding: 18px !important;
+      box-shadow: 0 24px 80px rgba(0,0,0,.35);
+      animation: fadeSlide .6s ease;
+    }
+    @keyframes fadeSlide {
+      from {opacity:0; transform: translateY(10px);}
+      to {opacity:1; transform: translateY(0);}
+    }
+    .hero {
+      background: linear-gradient(120deg, rgba(122,140,255,.22), rgba(49,208,170,.2));
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      padding: 20px 24px;
+      margin-bottom: 14px;
+      backdrop-filter: blur(8px);
+    }
+    .hero h1 {margin: 0; font-size: 30px; line-height: 1.2;}
+    .hero p {margin: 8px 0 0; color: var(--muted);}
+    .result-box {
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      padding: 14px;
+      background: var(--card);
+      animation: pop .35s ease;
+    }
+    .glass {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: var(--card);
+      padding: 12px;
+    }
+    .primary-btn button {
+      background: linear-gradient(90deg, var(--accent), #93a1ff) !important;
+      color: #09112f !important;
+      border: none !important;
+      font-weight: 700 !important;
+      transition: transform .12s ease, box-shadow .12s ease;
+      box-shadow: 0 10px 28px rgba(122,140,255,.35);
+    }
+    .primary-btn button:hover {transform: translateY(-1px) scale(1.01);}
+    .image-frame {border: 1px solid var(--line); border-radius: 16px; overflow: hidden;}
+    @keyframes pop {from {opacity:0; transform: scale(.985);} to {opacity:1; transform: scale(1);}}
+    """
+
+    with gr.Blocks(title="Deepfake Voice Detector", css=custom_css, theme=gr.themes.Base()) as demo:
+        gr.HTML(
+            """
+            <div class='hero'>
+              <h1>🎙️ Deepfake Voice Detection Studio</h1>
+              <p>Industry-style analysis pipeline with Grad-CAM evidence, temporal attention analytics, and Gemini reasoning. Upload MP3/WAV/M4A/FLAC/OGG and review aligned visual outputs.</p>
+            </div>
+            """
+        )
+
+        with gr.Row(equal_height=True):
+            with gr.Column(scale=1, elem_classes=["glass"]):
+                audio_input = gr.Audio(
+                    type="filepath",
+                    label="Upload Audio (MP3, WAV, M4A, FLAC, OGG)",
+                    format="wav",
+                )
+                api_key_input = gr.Textbox(
+                    type="password",
+                    label="Gemini API Key (optional if GEMINI_API_KEY env is set)",
+                    placeholder="AIza...",
+                )
+                submit_btn = gr.Button("Analyze Audio", variant="primary", elem_classes=["primary-btn"])
+                gr.Markdown(
+                    "✅ **Workflow**: Preprocess → Predict (REAL/FAKE) → Grad-CAM + Attention → Gemini Explanation"
+                )
+            with gr.Column(scale=2):
+                prediction_md = gr.Markdown(elem_classes=["result-box"])
+                explanation_tb = gr.Textbox(
+                    label="Human-readable Explanation",
+                    lines=14,
+                    max_lines=24,
+                    elem_classes=["glass"],
+                )
+
+        with gr.Row(equal_height=True):
+            gradcam_img = gr.Image(label="Grad-CAM Overlay", type="filepath", elem_classes=["image-frame"])
+            attention_img = gr.Image(label="Attention Plot", type="filepath", elem_classes=["image-frame"])
+
+        submit_btn.click(
+            _predict,
+            inputs=[audio_input, api_key_input],
+            outputs=[prediction_md, explanation_tb, gradcam_img, attention_img],
+        )
+
+    print(f"Launching UI at: http://{args.host}:{args.port}")
+    demo.launch(server_name=args.host, server_port=args.port, share=args.share, inbrowser=True)
+
+
+# ==========================================================
+# ENTRY POINT
+# ==========================================================
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Prediction + Grad-CAM + Gemini explanation (CLI or browser UI)"
+    )
+    parser.add_argument("--audio_path", type=str, default="", help="Path to user input audio file (CLI mode)")
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default="artifacts/models/best_cnn_bilstm.pt",
+        help="Path to trained checkpoint",
+    )
+    parser.add_argument(
+        "--gemini_model",
+        type=str,
+        default="gemini-2.5-pro",
+        help="Gemini model name to use for reasoning",
+    )
+    parser.add_argument(
+        "--gemini_api_key",
+        type=str,
+        default="",
+        help="Gemini API key (or set GEMINI_API_KEY env var)",
+    )
+    parser.add_argument(
+        "--cli",
+        action="store_true",
+        help="Run command-line mode (default is browser UI mode)",
+    )
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="UI host")
+    parser.add_argument("--port", type=int, default=7860, help="UI port")
+    parser.add_argument("--share", action="store_true", help="Create public Gradio share link")
+    return parser
+
+
+if __name__ == "__main__":
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.cli:
+        if not args.audio_path:
+            parser.error("--audio_path is required when --cli is used.")
+        run_single_audio_pipeline(args)
+    else:
+        launch_ui(args)
+
+
+
+
+
+AIzaSyCPNNSVmnxrNDZ95fCnOmpIetyvyO6DB6w

@@ -1,0 +1,14 @@
+# FastAPI web server requirements
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
+
+# Audio & ML (your project already has these)
+librosa>=0.10.0
+numpy>=1.24.0
+torch>=2.0.0
+matplotlib>=3.7.0
+Pillow>=10.0.0
+
+# Gemini (optional — for LLM explanation)
+google-genai>=1.0.0

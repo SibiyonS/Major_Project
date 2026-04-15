@@ -1,0 +1,148 @@
+import argparse
+from pathlib import Path
+
+import librosa
+import librosa.display
+from librosa.filters import mel
+import matplotlib.pyplot as plt
+import numpy as np
+#from streamlit import audio
+import torch
+
+from src.config import AudioConfig, XAI_DIR
+from src.data import load_and_preprocess_audio
+from src.model import CnnBiLstmDetector
+
+
+def gradcam_for_sample(model, x, device):
+    activations = {}
+    gradients = {}
+
+    def fwd_hook(_, __, output):
+        activations["value"] = output
+
+    def bwd_hook(_, grad_input, grad_output):
+        gradients["value"] = grad_output[0]
+
+    target_layer = model.features[8]
+    h1 = target_layer.register_forward_hook(fwd_hook)
+    h2 = target_layer.register_full_backward_hook(bwd_hook)
+
+    model.zero_grad()
+    logits, attention = model(x, return_attention=True)
+    score = torch.sigmoid(logits)[0]
+    score.backward()
+
+    acts = activations["value"]
+    grads = gradients["value"]
+    weights = grads.mean(dim=(2, 3), keepdim=True)
+    cam = (weights * acts).sum(dim=1, keepdim=True)
+    cam = torch.relu(cam)
+    cam = torch.nn.functional.interpolate(cam, size=x.shape[-2:], mode="bilinear", align_corners=False)
+
+    cam_np = cam.squeeze().detach().cpu().numpy()
+    cam_np = (cam_np - cam_np.min()) / (cam_np.max() - cam_np.min() + 1e-8)
+
+    attn_np = attention.squeeze().detach().cpu().numpy()
+
+    h1.remove()
+    h2.remove()
+    return cam_np, attn_np, float(score.detach().cpu().item())
+
+
+def main(args):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    cfg = AudioConfig()
+    # ✅ Ensure XAI directory exists
+    XAI_DIR.mkdir(parents=True, exist_ok=True)
+
+    checkpoint = torch.load(args.model_path, map_location=device)
+    mcfg = checkpoint.get("config", {})
+    model = CnnBiLstmDetector(hidden_size=mcfg.get("hidden_size", 128), dropout=mcfg.get("dropout", 0.3)).to(device)
+    model.load_state_dict(checkpoint["model_state"])
+    model.eval()
+
+    mel = load_and_preprocess_audio(args.audio_path, cfg)
+    x = torch.tensor(mel).unsqueeze(0).unsqueeze(0).to(device)
+
+    cam, attn, score = gradcam_for_sample(model, x, device)
+    pred = "FAKE" if score >= 0.5 else "REAL"
+
+    """plt.figure(figsize=(10, 4))
+    librosa.display.specshow(mel, sr=cfg.sample_rate, hop_length=cfg.hop_length, x_axis="time", y_axis="mel")
+    plt.imshow(cam, cmap="jet", alpha=0.35, origin="lower", aspect="auto")
+    plt.colorbar(label="Grad-CAM importance")
+    plt.title(f"Grad-CAM Explanation | Prediction={pred} | score={score:.3f}")
+    plt.tight_layout()
+    plt.savefig(str(XAI_DIR / "gradcam_overlay.png"), dpi=200)
+    plt.close()"""
+
+    audio, sr = librosa.load(args.audio_path, sr=cfg.sample_rate)
+    real_duration = len(audio) / sr
+
+    plt.figure(figsize=(10, 4))
+
+    # Base mel spectrogram
+    plt.imshow(
+        mel,
+        aspect="auto",
+        origin="lower",
+        extent=[0, real_duration, 0, mel.shape[0]]
+    )
+
+    # Grad-CAM overlay
+    plt.imshow(
+        cam,
+        cmap="jet",
+        alpha=0.35,
+        origin="lower",
+        aspect="auto",
+        extent=[0, real_duration, 0, mel.shape[0]]
+    )
+
+    plt.xlabel("Time (seconds)")
+    plt.ylabel("Mel bins")
+    plt.colorbar(label="Grad-CAM importance")
+    plt.title(f"Grad-CAM Explanation | Prediction={pred} | score={score:.3f}")
+    plt.tight_layout()
+    plt.savefig(XAI_DIR / "gradcam_overlay.png", dpi=200)
+    plt.close()
+
+
+    plt.figure(figsize=(10, 3))
+    plt.plot(attn)
+    plt.title("BiLSTM Attention Over Time Frames")
+    plt.xlabel("Time frame")
+    plt.ylabel("Attention weight")
+    plt.tight_layout()
+    plt.savefig(str(XAI_DIR / "attention_weights.png"), dpi=200)
+    plt.close()
+
+    explanation = f"""
+Prediction: {pred} (probability of fake={score:.3f})
+
+Simple explanation:
+1) Model first turns voice into a mel-spectrogram image.
+2) CNN finds local artifacts (unnatural harmonics, vocoder texture, phase inconsistencies).
+3) BiLSTM reads pattern evolution over time.
+4) Attention shows which time parts influenced the final decision.
+5) Grad-CAM heatmap highlights frequency-time regions responsible for the prediction.
+""".strip()
+
+    out_txt = XAI_DIR / "simple_explanation.txt"
+    out_txt.write_text(explanation, encoding="utf-8")
+    print(explanation)
+    print(f"Saved XAI outputs in: {XAI_DIR}")
+    print("Sample Rate:", cfg.sample_rate)
+    print("Hop Length:", cfg.hop_length)
+    print("Mel Shape:", mel.shape)
+
+    duration = mel.shape[1] * cfg.hop_length / cfg.sample_rate
+    print("Calculated Duration:", duration)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Generate explainability outputs for one audio sample")
+    parser.add_argument("--audio_path", type=str, required=True)
+    parser.add_argument("--model_path", type=str, default="artifacts/models/best_cnn_bilstm.pt")
+    main(parser.parse_args())

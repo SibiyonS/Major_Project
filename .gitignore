@@ -1,0 +1,20 @@
+# Ignore dataset
+dataset_root/
+voicesample/
+
+# Ignore artifacts / outputs
+artifacts/
+*.png
+*.jpg
+*.pdf
+
+# Python cache
+__pycache__/
+*/__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
+
+# VS Code settings (optional)
+.vscode/

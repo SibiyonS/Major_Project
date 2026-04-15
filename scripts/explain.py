@@ -27,7 +27,11 @@ from src.model import CnnBiLstmDetector
 
 DEFAULT_MODEL_PATH = "artifacts/models/best_cnn_bilstm.pt"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
-DEFAULT_GEMINI_API_KEY = "AIzaSyCPNNSVmnxrNDZ95fCnOmpIetyvyO6DB6w"
+GEMINI_API_KEYS = [
+    "AIzaSyDYm4QXE0azSxb_5aikb7K5YScnizNQ9XI",
+    "AIzaSyCPNNSVmnxrNDZ95fCnOmpIetyvyO6DB6w",
+    "AIzaSyC8F7X1X1X1X1X1X1X1X1X1X1X1X1X1X1",
+]
 ALLOWED_AUDIO_EXTENSIONS = {"wav", "mp3", "flac", "m4a", "ogg"}
 
 
@@ -92,7 +96,7 @@ def gradcam_for_sample(model: CnnBiLstmDetector, x: torch.Tensor) -> Tuple[np.nd
     return cam_np, attn_np, float(prob.detach().cpu().item())
 
 
-def generate_reason_with_gemini(pred: str, score: float, cam_path: str, attn_path: str, model_name: str, api_key: str) -> str:
+'''def generate_reason_with_gemini(pred: str, score: float, cam_path: str, attn_path: str, model_name: str, api_key: str) -> str:
     try:
         import google.generativeai as genai  # type: ignore
         from PIL import Image
@@ -104,7 +108,8 @@ def generate_reason_with_gemini(pred: str, score: float, cam_path: str, attn_pat
         response = model.generate_content(
             contents=[
                 "Explain the detail in about 200 words by analyzing the image given which is a grad-cam and attention Blistm image"
-                "convert you point into the statement and produce to the end user in simple,neat and in the understandable formate",
+                "convert you point into the statement and produce to the end user in simple,neat and in the understandable formate"
+                "make simple and easy to understand for the non technical user and teach like teaching to the beginner",
                 f"Prediction: {pred}\nFake Probability: {score:.3f}\nConfidence: {confidence}",
                 Image.open(cam_path),
                 Image.open(attn_path),
@@ -113,7 +118,43 @@ def generate_reason_with_gemini(pred: str, score: float, cam_path: str, attn_pat
         text = getattr(response, "text", "")
         return text.strip() if text else f"Prediction: {pred}\nConfidence: {confidence}\nNo LLM text returned."
     except Exception as e:
-        return f"Gemini API Error: {e}\nFallback prediction: {pred} ({score:.3f})"
+        return f"Gemini API Error: {e}\nFallback prediction: {pred} ({score:.3f})"'''
+
+def generate_reason_with_gemini(pred, score, cam_path, attn_path, model_name):
+    import google.generativeai as genai
+    from PIL import Image
+
+    confidence = "Low" if score > 0.8 else ("Moderate" if score > 0.6 else "High")
+
+    last_error = None
+
+    for api_key in GEMINI_API_KEYS:
+        try:
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel(model_name)
+
+            response = model.generate_content(
+              contents=[
+                  "Explain the detail in about 200 words by analyzing the image given which is a grad-cam and attention Blistm image"
+                  "convert you point into the statement and produce to the end user in simple,neat and in the understandable formate"
+                  "make simple and easy to understand for the non technical user and teach like teaching to the beginner",
+                  f"Prediction: {pred}\nFake Probability: {score:.3f}\nConfidence: {confidence}",
+                  Image.open(cam_path),
+                  Image.open(attn_path),  
+              ]
+            )
+
+            text = getattr(response, "text", "")
+            if text:
+                print(f"[Gemini] Success with key: {api_key[:6]}***")
+                return text.strip()
+
+        except Exception as e:
+            print(f"[Gemini] Key failed: {api_key[:6]}*** | Error: {e}")
+            last_error = e
+            continue
+
+    return f"All API keys failed. Last error: {last_error}"
 
 
 def save_gradcam_overlay(mel: np.ndarray, cam: np.ndarray, attn: np.ndarray, title: str, cfg: AudioConfig, audio_path: str, out_path: Path) -> Path:
@@ -225,10 +266,10 @@ def classify_audio_from_chunks(probs: list[float], attn: np.ndarray | None = Non
     shutil.copy2(attn_path, XAI_DIR / "attention_weights.png")'''
 
 
-def run_single_audio_pipeline(audio_path: str, model_path: str, gemini_model: str, gemini_api_key: str) -> dict:
+def run_single_audio_pipeline(audio_path: str, model_path: str, gemini_model: str) -> dict:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     cfg = AudioConfig()
-    threshold = _load_runtime_threshold(0.5)
+    threshold = _load_runtime_threshold(0.563)
 
     XAI_DIR.mkdir(parents=True, exist_ok=True)
     model = load_model(model_path, device)
@@ -280,15 +321,21 @@ def run_single_audio_pipeline(audio_path: str, model_path: str, gemini_model: st
     attention_path = save_attention_plot(attn_weights, out_path=attn_path)
     #_publish_latest_images(overlay_path, attention_path)
 
-    api_key = gemini_api_key or os.getenv("GEMINI_API_KEY", "")
-    if not api_key:
+    #api_key = gemini_api_key or os.getenv("GEMINI_API_KEY", "")
+    try:
+        explanation = generate_reason_with_gemini(
+            pred,
+            score,
+            str(overlay_path),
+            str(attention_path),
+            gemini_model
+        )
+    except Exception as e:
         explanation = (
-            "Gemini API key missing. Set GEMINI_API_KEY for AI explanation.\n"
+            f"Gemini failed: {e}\n"
             f"Prediction: {pred} (score={score:.3f}, threshold={threshold:.2f}).\n"
             "Grad-CAM and attention outputs are generated and saved."
         )
-    else:
-        explanation = generate_reason_with_gemini(pred, score, str(overlay_path), str(attention_path), gemini_model, api_key)
 
     out_txt = XAI_DIR / "gemini_explanation.txt"
     out_txt.write_text(explanation, encoding="utf-8")
@@ -514,7 +561,7 @@ def analyze_page():
   .cards{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-top:16px}
   .card{padding:14px}.k{font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted)}.v{font-size:24px;font-weight:800;margin-top:4px}.good{color:var(--good)} .bad{color:var(--danger)}
   .result-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px}
-  .img-wrap{padding:14px}.img-wrap img{width:100%;min-height:240px;object-fit:cover;border:1px solid var(--line);border-radius:12px;background:rgba(0,0,0,.18)}
+  .img-wrap{padding:14px}.img-wrap img{width:100%;min-height:240px;object-fit: contain;border:1px solid var(--line);border-radius:12px;background:rgba(0,0,0,.18)}
   .audio-shell{margin-top:10px;padding:12px;border-radius:14px;border:2px solid var(--line);background:linear-gradient(135deg,color-mix(in srgb,var(--accent) 25%, transparent),color-mix(in srgb,var(--accent2) 20%, transparent))}
   .audio-shell:hover{border-color:var(--accent);background:rgba(110,231,255,.16)}
   audio{width:100%;filter:drop-shadow(0 0 8px color-mix(in srgb,var(--accent) 45%, transparent))}
@@ -799,7 +846,7 @@ def analyze_audio():
             audio_path=str(saved_path),
             model_path=DEFAULT_MODEL_PATH,
             gemini_model=DEFAULT_GEMINI_MODEL,
-            gemini_api_key=os.getenv("GEMINI_API_KEY", DEFAULT_GEMINI_API_KEY),
+            #gemini_api_key=os.getenv("GEMINI_API_KEY", DEFAULT_GEMINI_API_KEY),
         )
     except Exception as exc:
         return jsonify({"error": f"Inference failed: {exc}"}), 500

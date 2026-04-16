@@ -1,7 +1,0 @@
-Our AI system has analyzed the audio and confidently determined it to be **REAL**.
-
-The first image, a 'Grad-CAM' sound map, acts like a spotlight, showing us exactly where the AI focused its attention to make this decision. Think of it as a heatmap of the sound's 'fingerprint.' Bright yellow and red areas indicate the parts the AI found most crucial, while darker purple means less important. Here, we can see the AI heavily focused on the initial segment of the sound (the left side of the map), and across various pitches. This early activity seems to carry significant weight for its 'real' classification. After about 4 seconds, much of the sound appears less critical, showing mostly dark purple.
-
-The white line overlaid on the map, and further detailed in the second 'Attention' graph, shows us how the AI's focus varied over time. It highlights that the AI paid strong attention at the beginning and, interestingly, also showed a significant spike in attention right at the very end of the audio.
-
-In essence, the AI found the specific patterns and energy distribution in the early parts, along with a strong concluding segment, to be highly characteristic of genuine audio, leading to its confident 'REAL' prediction with an extremely low probability of it being fake (0.001%).

@@ -3,7 +3,9 @@ dataset_root/
 voicesample/
 
 # Ignore artifacts / outputs
-artifacts/
+artifacts/dataset_wav
+artifacts/features
+
 
 # Python cache
 __pycache__/

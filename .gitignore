@@ -1,19 +1,20 @@
-# Ignore dataset
+# ML / Audio
+.vscode/
 dataset_root/
-voicesample/
+artifacts/
+*.wav
+*.mp3
 
-# Ignore artifacts / outputs
-artifacts/dataset_wav
-artifacts/features
+# Models
+*.pt
+*.pth
+*.ckpt
 
-
-# Python cache
+# Python
 __pycache__/
-*/__pycache__/
 *.pyc
-
-# Virtual environment
 venv/
 
-# VS Code settings (optional)
-.vscode/
+# OS
+.DS_Store
+Thumbs.db
